@@ -1,0 +1,187 @@
+import boto3
+import zipfile  # Ensure zipfile is imported
+import os
+import time
+import json
+
+def create_iam_role(role_name):
+    """
+    Create an IAM role with policies for Lambda to manage SSM documents.
+    If the role already exists, it will return the ARN of the existing role.
+    """
+    iam_client = boto3.client('iam', region_name='us-east-1')  # Region explicitly set
+
+    assume_role_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": "lambda.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+            }
+        ]
+    }
+
+    try:
+        # Check if the role exists
+        try:
+            response = iam_client.get_role(RoleName=role_name)
+            print(f"IAM Role '{role_name}' already exists.")
+            return response['Role']['Arn']
+        except iam_client.exceptions.NoSuchEntityException:
+            print(f"IAM Role '{role_name}' does not exist. Creating a new role.")
+        
+        # Create the IAM Role if it does not exist
+        response = iam_client.create_role(
+            RoleName=role_name,
+            AssumeRolePolicyDocument=json.dumps(assume_role_policy),
+            Description="Role for Lambda function to manage SSM documents"
+        )
+        print(f"IAM Role '{role_name}' created successfully.")
+        
+        # Attach policies for Lambda and SSM
+        iam_client.attach_role_policy(
+            RoleName=role_name,
+            PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        )
+        iam_client.attach_role_policy(
+            RoleName=role_name,
+            PolicyArn="arn:aws:iam::aws:policy/AmazonSSMFullAccess"
+        )
+
+        # Attach the iam:PassRole policy for the specific resource
+        iam_client.put_role_policy(
+            RoleName=role_name,
+            PolicyName="PassRolePolicy",
+            PolicyDocument=json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": "iam:PassRole",
+                        "Resource": "arn:aws:iam::829495335343:role/fcc-test-alarm-automations-role"  # Allow passrole for this specific resource
+                    }
+                ]
+            })
+        )
+
+        print("Policies attached to the IAM role.")
+
+        # Wait for a few seconds to ensure the role is fully created
+        time.sleep(10)
+        return response['Role']['Arn']
+    except Exception as e:
+        print(f"Error creating IAM role: {str(e)}")
+        raise
+
+def create_lambda_function():
+    """
+    Creates an AWS Lambda function that updates the runtime version
+    of an SSM document to Python 3.9.
+    """
+    lambda_client = boto3.client('lambda', region_name='us-east-1')  # Region explicitly set
+    iam_role_name = "LambdaSSMUpdateRole"
+    function_name = "UpdateSSMDocumentRuntime"
+
+    # Create IAM role and get its ARN
+    role_arn = create_iam_role(iam_role_name)
+
+    runtime = "python3.9"
+    handler = "update_ssm_document.lambda_handler"  # Filename.function_name
+
+    # Lambda function code
+    lambda_code = """
+import boto3
+import json
+
+def lambda_handler(event, context):
+    ssm_client = boto3.client('ssm', region_name='us-east-1')  # Region explicitly set
+    document_name = "fcc-test-verify-ec2-alarms-automation"
+    target_runtime = "python3.9"
+
+    try:
+        # Get the document's current latest version
+        response = ssm_client.get_document(Name=document_name, DocumentFormat="JSON")
+        document_content = json.loads(response['Content'])
+        default_version = response['DocumentVersion']  # Latest version is default
+
+        # Check the structure and modify the correct part of the document
+        if 'mainSteps' in document_content:
+            for step in document_content['mainSteps']:
+                if 'inputs' in step:
+                    for input_key in step['inputs']:
+                        if 'runtime' in step['inputs'][input_key]:  # Check if the runtime exists in inputs
+                            step['inputs'][input_key] = target_runtime  # Update runtime value
+                            break
+
+        # Update the document's content for the latest version (default version)
+        update_response = ssm_client.update_document(
+            Name=document_name,
+            Content=json.dumps(document_content),
+            DocumentVersion=default_version,  # Update the latest version
+            DocumentFormat="JSON"
+        )
+
+        print(f"Successfully updated the runtime of '{document_name}' to {target_runtime} for version {default_version}.")
+
+        # Now, set this updated version as the default version
+        ssm_client.update_document_default_version(
+            Name=document_name,
+            DocumentVersion=default_version  # Make this updated version the default
+        )
+
+        print(f"Successfully set version {default_version} as the default version for '{document_name}'.")
+
+    except Exception as e:
+        print(f"Error updating the SSM document '{document_name}': {str(e)}")
+        raise
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps(f"SSM document '{document_name}' runtime updated to {target_runtime} for the default version.")
+    }
+"""
+
+    # Save the Lambda code to a file
+    file_name = "update_ssm_document.py"
+    with open(file_name, "w") as f:
+        f.write(lambda_code)
+
+    # Create a ZIP package for the Lambda function
+    zip_file_name = "lambda_function.zip"
+    with zipfile.ZipFile(zip_file_name, "w") as zipf:
+        zipf.write(file_name)
+
+    # Clean up the local Python file
+    os.remove(file_name)
+
+    # Upload the Lambda function
+    try:
+        with open(zip_file_name, "rb") as f:
+            zipped_code = f.read()
+
+        response = lambda_client.create_function(
+            FunctionName=function_name,
+            Runtime=runtime,
+            Role=role_arn,
+            Handler=handler,
+            Code=dict(ZipFile=zipped_code),
+            Description="Lambda function to update SSM document runtime to Python 3.9",
+            Timeout=10,
+            MemorySize=128,
+            Publish=True
+        )
+        print("Lambda function created successfully:", response)
+    except Exception as e:
+        print("Error creating Lambda function:", str(e))
+    finally:
+        # Clean up the ZIP file
+        if os.path.exists(zip_file_name):
+            os.remove(zip_file_name)
+
+# Run the script to create the Lambda function
+if __name__ == "__main__":
+    create_lambda_function()
+
